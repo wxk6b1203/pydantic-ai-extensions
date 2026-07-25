@@ -32,6 +32,9 @@ dev = [
 [tool.hatch.build.targets.wheel]
 packages = ["src/pydantic_ai_extensions"]
 
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
+
 [tool.ruff]
 line-length = 120
 target-version = "py313"

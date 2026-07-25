@@ -105,9 +105,65 @@ make test       # 单元/集成测试（FunctionModel，无外部调用）
 make lint       # ruff check
 make format     # ruff format + --fix
 make typecheck  # pyright (strict)
+make version    # 从当前 git 状态重新生成 _version.py（构建时也会自动生成）
+make build      # 打 wheel + sdist 到 dist/（构建时自动烘焙 git 版本）
 
-uv run pytest --live -m live   # 真实 API 测试（需 DEEPSEEK_API_KEY，默认跳过）
+uv run pytest --live -m live   # 真实 API 测试（需 DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL / DEEPSEEK_MODEL 环境变量，默认跳过）
 ```
+
+## 版本信息（git 烘焙，零第三方依赖）
+
+不发布到 PyPI 时，调用方仍需知道"我跑的到底是哪个 commit"。本包用 hatchling 的 **build hook**（`hatch_build.py`，纯 stdlib + `git` 二进制）在**每次构建时**把 git 状态烘焙进 `src/pydantic_ai_extensions/_version.py`（gitignored 构建产物）。无需 `hatch-vcs`/`setuptools-scm` 等第三方依赖，安装方也无需 git。
+
+```python
+import pydantic_ai_extensions as p
+
+p.__version__        # 精确版本，如 '1.2.3' / '1.2.3+5.g9a8b7c6.dirty' / '0.0.0+g8d7220f.dirty'
+p.__version_info__   # 发布段元组，如 (1, 2, 3)
+p.__commit__         # 短 commit 哈希，如 '8d7220f'
+p.__commit_full__    # 完整哈希
+p.__branch__         # 分支名
+p.__describe__       # 原始 git describe 输出
+p.__dirty__          # 'true' / 'false'（工作区是否有未提交改动）
+p.get_version()      # 等于 __version__
+```
+
+版本派生规则（PEP 440-ish）：
+
+| git 状态 | `__version__` |
+|----------|---------------|
+| 干净标签 `v1.2.3` | `1.2.3` |
+| 分支领先标签 5 个提交 | `1.2.3+5.g9a8b7c6` |
+| 上述且工作区脏 | `1.2.3+5.g9a8b7c6.dirty` |
+| 无版本标签（仅 commit） | `0.0.0+g8d7220f` |
+| 无 git 且无已烘焙的 `_version.py`（如未构建过的 `.git`-less 源码副本） | `0.0.0+unknown` |
+
+机制要点：
+
+- **何时烘焙**：`uv build` / `uv sync`（editable 自装）/ `uv add <path|git>` / `pip install` 都会触发 build hook，写一次 `_version.py`。editable 安装或 `uv add git+...` 时 git 在场，烘焙出真实版本；从 sdist 构建 wheel 时无 git，hook 保留 sdist 阶段已烘焙的值（sdist 被 `force_include` 纳入了该文件），不会退化成 `unknown`。
+- **包元数据 `version`** 是静态发布线（`0.1.0`，即 `pip show` 看到的）；`__version__` 才是含 commit 的**精确**标识。发版时 `git tag v0.1.0`，则两者一致。
+- **fresh checkout 直接 import**（未先 build）：`_version.py` 不存在时，`version.py` 回退到运行时 `git describe`，所以在任意分支上直接跑也能拿到有意义的版本。
+- 调用方排查"我用的哪个版本"：`python -c "import pydantic_ai_extensions as p; print(p.__version__, p.__commit__)"`。
+
+## 引入方式（不发布到 PyPI）
+
+- **同机协同开发**（editable，改源码即时生效）：
+  ```bash
+  uv add --editable /path/to/pydantic-ai-extensions
+  ```
+  ```toml
+  [tool.uv.sources]
+  pydantic-ai-extensions = { path = "/path/to/pydantic-ai-extensions", editable = true }
+  ```
+
+- **私有 Git**（部署 / 多机 / CI，需锁版本时推荐）：
+  ```bash
+  uv add "git+ssh://git@github.com/<owner>/pydantic-ai-extensions.git@v0.1.0"
+  ```
+
+- **构建 wheel 离线交付**：`make build` 后 `uv add ./dist/pydantic_ai_extensions-0.1.0-py3-none-any.whl`。
+
+> 消费方若用 DeepSeek/OpenAI 兼容模型，需自行加 provider extra：`uv add "pydantic-ai-slim[openai]"`（本包的 `[anthropic,openai]` extra 仅用于自身测试，不传递）。
 
 ## 文档
 
