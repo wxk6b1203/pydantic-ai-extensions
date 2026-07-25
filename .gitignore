@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Generated build provenance (written by hatch_build.py at build time, gitignored)
+src/pydantic_ai_extensions/_version.py
+
+# macOS
+.DS_Store
