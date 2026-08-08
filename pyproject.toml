@@ -8,11 +8,7 @@ version = "0.1.0"
 description = "Community extensions for Pydantic AI (context compression, etc.)"
 requires-python = ">=3.13"
 dependencies = [
-    # Floor: 2.9.0 is the version the capability API surface is verified against
-    # (capabilities, InstructionPart, NativeToolCallPart/NativeToolReturnPart,
-    # CompactionPart, ReinjectSystemPrompt, RunContext.conversation_id). Older 2.x and
-    # all 1.x releases lack some of these symbols and fail at import time.
-    "pydantic-ai-slim>=2.9.0",
+    "pydantic-ai-slim>=2.26.0",
     "tiktoken>=0.12.0",
 ]
 

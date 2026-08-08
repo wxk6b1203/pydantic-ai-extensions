@@ -14,7 +14,7 @@
 pip install pydantic-ai-extensions
 ```
 
-要求：Python ≥ 3.13，`pydantic-ai-slim` ≥ 2.9.0，`tiktoken` ≥ 0.12.0（token 估算；不可用时按字符数兜底）。
+要求：Python ≥ 3.13，`pydantic-ai-slim` ≥ 2.26.0，`tiktoken` ≥ 0.12.0（token 估算；不可用时按字符数兜底）。
 
 ## 快速开始
 

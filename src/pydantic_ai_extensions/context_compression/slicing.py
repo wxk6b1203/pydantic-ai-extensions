@@ -2,7 +2,7 @@
 
 The core invariant: a cutoff must never split a ``ToolCallPart`` from its matching
 ``ToolReturnPart`` / ``RetryPromptPart`` (matched by ``tool_call_id``). All three
-part types carry ``tool_call_id`` (verified against pydantic-ai-slim 2.9.0).
+part types carry ``tool_call_id`` (verified against pydantic-ai-slim 2.9.0, unchanged through 2.26.0).
 """
 
 from __future__ import annotations

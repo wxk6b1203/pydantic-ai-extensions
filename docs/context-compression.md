@@ -1,6 +1,6 @@
 # 上下文自动压缩（Context Compression）设计
 
-> 状态：已实现（P1–P6 + 评审加固轮 P7；对应 `pydantic-ai-slim >= 2.9.0`）
+> 状态：已实现（P1–P6 + 评审加固轮 P7；对应 `pydantic-ai-slim >= 2.26.0`）
 > 目标项目：`pydantic-ai-extensions`（greenfield 脚手架）
 > 依赖框架：`pydantic-ai-slim`
 > 适用场景：多 provider 通用（含 DeepSeek 等 OpenAI-Chat 兼容 provider），为长会话 agent 自动压缩历史上下文
@@ -645,7 +645,7 @@ name = "pydantic-ai-extensions"
 version = "0.1.0"
 requires-python = ">=3.13"
 dependencies = [
-    "pydantic-ai-slim>=2.9.0",
+    "pydantic-ai-slim>=2.26.0",
     "tiktoken>=0.12.0",
 ]
 
@@ -676,7 +676,7 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 ```
 
-> `pydantic-ai-slim` 版本约束锁定 `>=2.9.0`：除 `AbstractCapability` 钩子、`ModelRequestContext`、`CapabilityOrdering` 外，实现还用到 `InstructionPart`/`NativeToolCallPart`/`NativeToolReturnPart`/`CompactionPart`/`ReinjectSystemPrompt`/`RunContext.conversation_id`——经实测这些符号在 1.74.0 **全部缺失**（更低的下限会在 import 时直接失败）。2.9.0 是实现与测试实际验证的版本。
+> `pydantic-ai-slim` 版本约束锁定 `>=2.26.0`（2026-08 从 2.9.0 升级；升级后 101 项测试、pyright strict 与弃用警告扫描均通过，本实现所用 API 面在 2.9.0 → 2.26.0 间无破坏性变动）。下限考虑：除 `AbstractCapability` 钩子、`ModelRequestContext`、`CapabilityOrdering` 外，实现还用到 `InstructionPart`/`NativeToolCallPart`/`NativeToolReturnPart`/`CompactionPart`/`ReinjectSystemPrompt`/`RunContext.conversation_id`——经实测这些符号在 1.74.0 **全部缺失**（更低的下限会在 import 时直接失败）。
 
 ### 9.2 包布局
 
