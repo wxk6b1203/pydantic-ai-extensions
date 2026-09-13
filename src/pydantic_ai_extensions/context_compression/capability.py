@@ -185,6 +185,12 @@ class ContextCompression(AbstractCapability[Any]):
                 "ContextCompression: persist=False without summary_store degrades to a full "
                 "re-summarize on every compaction (no cross-run incremental state, §5.3)."
             )
+        if not persist and summary_store is not None:
+            logger.info(
+                "ContextCompression: persist=False with summary_store keys cross-run state by "
+                "`ctx.conversation_id`; pass a stable `conversation_id` to every `agent.run` "
+                "(a fresh UUID7 is generated per run otherwise, so the store never hits)."
+            )
         self.summarizer = summarizer
         self.compress_threshold = compress_threshold
         self.max_tokens = max_tokens
@@ -266,6 +272,13 @@ class ContextCompression(AbstractCapability[Any]):
 
         Line-based head/tail truncation first; if that can't fit the token budget
         (single-line or huge-line output), fall back to a token-precise middle cut.
+
+        Oversized non-string results (dict/list/pydantic models) are replaced by their
+        *truncated string rendering* -- truncation necessarily degrades the type. The
+        model receives equivalent text either way, but downstream consumers that rely
+        on the original Python type of the tool result (persistence schemas, audit
+        replays) should not enable `max_tool_output_tokens` or should wrap such tools.
+        Binary media (including nested in structures) is never stringified.
         """
         if self.max_tool_output_tokens is None:
             return result
@@ -315,7 +328,9 @@ class ContextCompression(AbstractCapability[Any]):
             self.keep,
             self.max_tokens,
             self.keep_first_user_message,
-            count_tokens=self._estimate,
+            encoding=self.encoding,
+            char_per_token=self.char_per_token,
+            include_thinking=self.include_thinking_in_estimate,
         )
         if k < self.min_prefix:
             return None

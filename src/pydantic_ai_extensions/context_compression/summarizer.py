@@ -9,6 +9,7 @@ the result as a sentinel-tagged `ModelResponse`.
 from __future__ import annotations
 
 import re
+import zlib
 from collections.abc import Sequence
 from typing import Any
 
@@ -34,9 +35,13 @@ __all__ = [
 # consecutive same-role messages; part content survives merges and round-trips across runs.
 # `compacted_tokens` is optional: markers written by older versions lack it (parsed as None,
 # which skips the cooldown once and rewrites the field on the next compaction).
+# `sum` (crc32 hex of the body) is optional for the same backward-compatibility reason;
+# when present, `parse_summary_sentinel` verifies it, so a model echoing a marker-looking
+# string with a wrong/absent checksum of the *actual body* cannot be mistaken for a real
+# sentinel.
 _SENTINEL_RE = re.compile(
     r"^<conversation-summary generation=(\d+) covered_count=(\d+) strategy=(\w+)"
-    r"(?: compacted_tokens=(\d+))?>\n?(.*)$",
+    r"(?: compacted_tokens=(\d+))?(?: sum=([0-9a-f]{8}))?>\n?(.*)$",
     re.DOTALL,
 )
 
@@ -56,6 +61,11 @@ _INCREMENTAL_PROMPT = (
     "Merge the new content into the previous summary and output the updated full summary "
     "(coherent prose, do not itemize)."
 )
+
+
+def _body_checksum(text: str) -> str:
+    """8-hex crc32 of the summary body (collision guard, not security)."""
+    return f"{zlib.crc32(text.encode('utf-8')) & 0xFFFFFFFF:08x}"
 
 
 async def summarize_full(summarizer: Agent[Any, str], prefix_body: Sequence[ModelMessage]) -> AgentRunResult[str]:
@@ -80,13 +90,17 @@ def parse_summary_sentinel(content: str) -> SummaryRecord | None:
     """Parse a `<conversation-summary ...>` marker; return a SummaryRecord or None.
 
     Strict: the content must *start* with the full marker format. Model responses that
-    merely quote or echo a marker-looking string mid-text do not match.
+    merely quote or echo a marker-looking string mid-text do not match; when the marker
+    carries a `sum=` checksum (written by this version), the body must match it, so an
+    echoed marker whose checksum doesn't cover the trailing text is rejected too.
     """
     m = _SENTINEL_RE.match(content)
     if not m:
         return None
+    if m.group(5) is not None and m.group(5) != _body_checksum(m.group(6)):
+        return None
     return SummaryRecord(
-        text=m.group(5),
+        text=m.group(6),
         generation=int(m.group(1)),
         covered_count=int(m.group(2)),
         strategy=m.group(3),  # type: ignore[arg-type]
@@ -130,12 +144,14 @@ def build_summary_message(record: SummaryRecord) -> ModelResponse:
     The sentinel state (generation/covered_count/strategy) lives in the part *content*
     marker, not `ModelRequest.metadata`: `_clean_message_history` drops metadata when
     merging consecutive same-role messages, but part content survives -- so the sentinel
-    round-trips across runs.
+    round-trips across runs. A `sum=` crc32 of the body guards against false-positive
+    parses of model echoes that happen to reproduce the marker format.
     """
     tokens_attr = f" compacted_tokens={record.compacted_tokens}" if record.compacted_tokens is not None else ""
+    checksum_attr = f" sum={_body_checksum(record.text)}"
     content = (
         f"<conversation-summary generation={record.generation} covered_count={record.covered_count} "
-        f"strategy={record.strategy}{tokens_attr}>\n{record.text}"
+        f"strategy={record.strategy}{tokens_attr}{checksum_attr}>\n{record.text}"
     )
     return ModelResponse(parts=[TextPart(content=content)])
 

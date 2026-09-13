@@ -332,10 +332,11 @@ def should_trigger(messages, compress_threshold: ContextSize, max_tokens: int | 
 | `FilePart` 等媒体 | `"<media>"`（不计入精确 token） |
 
 > 上表描述的 `render_messages_to_text` 是**扁平散文渲染**，仅用于 token 估算。要点：
-> - **另计 `ModelRequest.instructions` 字段**（agent 系统提示，非 part）--模型实际要为它付 token，漏算会低估；渲染时对每个 `ModelRequest` 先输出其 `instructions` 再输出各 part。
+> - **`ModelRequest.instructions` 只计一次**（agent 系统提示，非 part）。框架在每次请求入历史时都会把当前 instructions 盖章到该请求上（`_agent_graph.py` `self.request.instructions = ...`）并**永久留在历史里**，但线上协议每次 API 调用只发送一份 system prompt（`_get_instruction_parts` 只取最后一次的值，插成单条 system 消息）。因此渲染时把 instructions 归因到**最后一条携带它的请求**、其余请求的副本不渲染——否则估算会随对话轮数线性膨胀（N 条请求重复计 N 份系统提示）。归因到"最后载体"同时保证任意后缀切片 `messages[k:]` 的估算也正确：后缀包含任一载体当且仅当包含全局最后载体。
+> - **二进制媒体按 `<binary>` 计**：`stringify` 递归识别 `data`+`media_type` 鸭子类型（及裸 `bytes`），嵌套在 dict/list/pydantic 模型内的 `BinaryContent` 也渲染为 `<binary>`，原始字节（转义后每字节最多 4 字符，比 base64 更糟）不再泄漏进估算、截断输出和摘要器 prompt。
 > - `UserPromptPart.content` 为序列时，`ImageUrl`/`AudioUrl`/`BinaryContent` 等非文本项渲染为 `<media>`（多模态有损，见 §6）。
-> - §5.8 摘要输入用的是另一个渲染器 `render_structured`（XML-ish 结构标记，保留角色/工具调用/返回的结构边界），两者独立。
-> - **快路径**：`_maybe_compact` 先按消息条数粗判（`len(messages) < min_prefix + 1` 直接返回 None——此时不可能存在长度 ≥ `min_prefix` 的可压缩前缀），免跑 tiktoken；仅长度可能超阈值时才调 `should_trigger`/`estimate_tokens`。注意 tokens/fraction 模式下，**每次模型请求**（含工具循环每步）仍会对当前历史做一次 render + tiktoken 编码（O（历史体量））；这是触发设计的固有成本，长会话下可接受，未来可按消息增量缓存计数优化。
+> - §5.8 摘要输入用的是另一个渲染器 `render_structured`（XML-ish 结构标记，保留角色/工具调用/返回的结构边界），两者独立；其对 instructions 同样只计一次。
+> - **快路径**：`_maybe_compact` 先按消息条数粗判（`len(messages) < min_prefix + 1` 直接返回 None——此时不可能存在长度 ≥ `min_prefix` 的可压缩前缀），免跑 tiktoken；仅长度可能超阈值时才调 `should_trigger`/`estimate_tokens`。注意 tokens/fraction 模式下，**每次模型请求**（含工具循环每步）仍会对当前历史做一次 render + tiktoken 编码（O（历史体量））；触发设计固有成本。**切点计算已优化**：`find_safe_split` 默认按消息逐条渲染计数一次（O(体量) 单遍编码），再用后缀和数组上二分，不再每步探针全量重编码（自定义 `count_tokens` 注入时保留旧的精确二分路径）；tiktoken 编码器经 `lru_cache` 复用。
 
 ### 5.5 安全边界切分（工具调用配对）
 
@@ -393,8 +394,8 @@ def build_summary_message(record: SummaryRecord) -> ModelResponse:
     return ModelResponse(parts=[TextPart(content=content)])
 ```
 
-- `persist=True`：sentinel 随历史持久化。`load_existing_summary` 经 `find_summary(prefix_body)` 扫描 `ModelResponse` 的 `TextPart`，用 `parse_summary_sentinel(content)` **严格解析**（正则锚定内容开头）：`<conversation-summary generation=N covered_count=K strategy=S compacted_tokens=T>` 后接正文。正则 `^<conversation-summary generation=(\d+) covered_count=(\d+) strategy=(\w+)(?: compacted_tokens=(\d+))?>\n?(.*)$`——`compacted_tokens` 可缺省以兼容旧版 sentinel；缺省解析为 `None`，冷却跳过一次、下次压缩补写。
-- **判定统一为严格正则解析**：`find_summary` / `prefix_body_after` / `load_existing_summary` 都只认完整匹配（不再用 `startswith`），取第一个完整匹配的 sentinel（capability 布局中真实 sentinel 恒在 head 之后第一位，先于任何模型逐字引用）。模型在历史中见过 sentinel 后复述标记的概率低，且复述通常不满足"内容开头 + 完整属性格式"。
+- `persist=True`：sentinel 随历史持久化。`load_existing_summary` 经 `find_summary(prefix_body)` 扫描 `ModelResponse` 的 `TextPart`，用 `parse_summary_sentinel(content)` **严格解析**（正则锚定内容开头）：`<conversation-summary generation=N covered_count=K strategy=S compacted_tokens=T sum=H>` 后接正文。正则 `^<conversation-summary generation=(\d+) covered_count=(\d+) strategy=(\w+)(?: compacted_tokens=(\d+))?(?: sum=([0-9a-f]{8}))?>\n?(.*)$`——`compacted_tokens` 可缺省以兼容旧版 sentinel；缺省解析为 `None`，冷却跳过一次、下次压缩补写。`sum` 是正文的 crc32 校验和（写入时计算）：**存在即校验**，不匹配（模型回显的标记、正文被截断/篡改）按"非 sentinel"处理，安全退化为全量重摘要；缺省（旧版 sentinel）跳过校验以保持向后兼容。
+- **判定统一为严格正则解析**：`find_summary` / `prefix_body_after` / `load_existing_summary` 都只认完整匹配（不再用 `startswith`），取第一个完整匹配的 sentinel（capability 布局中真实 sentinel 恒在 head 之后第一位，先于任何模型逐字引用）。模型在历史中见过 sentinel 后复述标记的概率本就低，且复述通常不满足"内容开头 + 完整属性格式"；`sum=` 校验和进一步把"恰好复现完整格式"的误命中概率压到 crc32 碰撞级别。
 - `persist=False`：sentinel 不全量进 state，跨 run 状态改由 `SummaryStore` 承载（`parse_summary_sentinel` 仍用于 same-run sentinel 检测）。
 - 标记也是轻量调试辅助；**判定以内容标记解析为准**（无 metadata 依赖）。
 
@@ -574,7 +575,7 @@ async def after_tool_execute(self, ctx, *, call, tool_def, args, result):
 1. **`before_model_request` 在多步工具循环里每次模型请求都触发**，且处理结果写回 state。阈值是触发线而非上限（§6.10），压缩后的历史仍可能在阈值之上——若不加控制，工具循环内**每一步**都会重压摘要（实测：单 run 6 步模型调用 → 6 次摘要调用，模型调用数与延迟翻倍）。因此引入**冷却机制**（`min_recompact_growth_tokens`，默认 2048）：每次压缩把"下次将看到的历史估算"记入 `SummaryRecord.compacted_tokens`（persist=True 写入 sentinel；persist=False 写入 store），仅当历史较该基线增长 ≥ delta 时才再次压缩。实测同场景 6 步 → 1 次摘要调用。`0`/`None` 关闭冷却（退回每步判定，仅建议测试用）。
 2. **tool-call/return 配对**：见 §5.5。`find_safe_split` 保证不悬空。
 3. **`CompactionPart` 跨 provider 不可用**：本能力**不产出** `CompactionPart`，只产出纯文本 `UserPromptPart`/`TextPart`，任何 provider 可读、可持久化、可跨 provider round-trip。若历史中残留过往原生压缩的 `CompactionPart`，`render` 时取其 `content`（Anthropic 可读）或忽略（OpenAI 加密，`content=None`），并在文档提示：跨 provider 前最好清洗。
-4. **系统提示（区分 `instructions` 与 `SystemPromptPart`，两个概念）**：2.x 框架在**每次**模型请求前重新解析 agent 的 `instructions` 并盖章到当前请求（`_agent_graph.py:954-957`：`self.request.instructions = ...`），因此压缩删掉 `messages[0]` 的 `instructions` 字段**不会**丢系统提示——当前请求始终携带最新 instructions。`keep_first_user_message=False` 的真正代价是首条用户消息**内容**被并入摘要（有损但可控）。而 `SystemPromptPart`（静态系统提示 part）是历史消息的一部分，落在 `prefix_body` 内会被摘要掉，需配套 `ReinjectSystemPrompt`（它补回的正是 `SystemPromptPart`，不是 `instructions`）或调大 `keep` 规避。
+4. **系统提示（区分 `instructions` 与 `SystemPromptPart`，两个概念）**：2.x 框架在**每次**模型请求前重新解析 agent 的 `instructions` 并盖章到当前请求（`_agent_graph.py`：`self.request.instructions = ...`），且该盖章**随请求永久留在历史里**——历史中每条 `ModelRequest` 都携带一份副本。压缩删掉 `messages[0]` 的 `instructions` 字段**不会**丢系统提示——当前请求始终携带最新 instructions。**估算侧的对应处理**：`render_messages_to_text`/`render_structured` 只渲染最后一条携带 instructions 的请求的副本（线上协议每次调用只发一份 system prompt，见 §5.4）。`keep_first_user_message=False` 的真正代价是首条用户消息**内容**被并入摘要（有损但可控）。而 `SystemPromptPart`（静态系统提示 part）是历史消息的一部分，落在 `prefix_body` 内会被摘要掉，需配套 `ReinjectSystemPrompt`（它补回的正是 `SystemPromptPart`，不是 `instructions`）或调大 `keep` 规避。
 5. **prompt cache 代价**：客户端重组历史会破坏 provider 的 prefix cache（OpenAI/Anthropic 均依赖前缀稳定）。这是客户端压缩相对 stateful 原生压缩的固有劣势，无原生可选时接受此代价。优化方向：摘要固定追加在 head 之后、recent 顺序不变，尽量保持前缀稳定。
 6. **token 估算精度**：tiktoken 对非 OpenAI 系为近似。阈值留足安全余量（如 context window 的 60–70%）。
 7. **并发**：`persist=False` + `SummaryStore` 时，store 实现须并发安全（多请求/多 run 可能并发读写同一 conversation）。`persist=True` 无此问题（状态在历史里，由调用方持久化逻辑串行化）。

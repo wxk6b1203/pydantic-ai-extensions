@@ -56,17 +56,22 @@ def _normalize_version(describe: str, short_sha: str, dirty: bool) -> str:
 
     Mirrors ``version.py._normalize_version`` -- keep the two in sync.
     """
-    m = re.match(r"^v?(\d[^-]*)-(\d+)-g([0-9a-f]+)$", describe)
+    # Non-greedy base: a pre-release tag (v1.2.3-rc1) yields describe
+    # `v1.2.3-rc1-2-gabc`; the base absorbs everything before the final `-N-g<sha>`.
+    m = re.match(r"^v?(.+?)-(\d+)-g([0-9a-f]+)$", describe)
     if m:
-        base, local = m.group(1), f"{m.group(2)}.g{m.group(3)}"
+        # PEP 440 pre-release separator: `1.2.3-rc1` -> `1.2.3rc1` (a raw `-` inside the
+        # release segment would make the version string unparsable).
+        base = re.sub(r"[-_]", "", m.group(1))
+        local = f"{m.group(2)}.g{m.group(3)}"
     elif describe and re.fullmatch(r"[0-9a-f]{7,40}", describe):
         # `--always` fallback: bare abbreviated commit, no version tag reachable
         base, local = "0.0.0", f"g{describe}"
     else:
         tag = re.sub(r"^v", "", describe)
         if tag and re.match(r"^\d", tag):
-            # a clean version tag, e.g. v1.2.3 -> 1.2.3
-            base, local = tag, ""
+            # a clean version tag, e.g. v1.2.3 / v1.2.3-rc1 -> 1.2.3 / 1.2.3rc1
+            base, local = re.sub(r"[-_]", "", tag), ""
         else:  # no git available at all
             base, local = "0.0.0", "unknown"
     if dirty:

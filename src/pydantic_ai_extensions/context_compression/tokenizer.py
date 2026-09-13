@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from functools import lru_cache
 from typing import Literal
 
 from pydantic_ai.messages import ModelMessage
@@ -39,6 +40,18 @@ DEFAULT_ENCODING = "o200k_base"
 """tiktoken encoding for OpenAI/DeepSeek-family models (approximate for others)."""
 
 
+@lru_cache(maxsize=8)
+def _get_encoder(enc_name: str):
+    """Cached tiktoken encoder lookup (unknown names raise ValueError, uncached)."""
+    import tiktoken
+
+    return tiktoken.get_encoding(enc_name)
+
+
+def _encode(text: str, enc_name: str) -> list[int]:
+    return _get_encoder(enc_name).encode(text, disallowed_special=())
+
+
 def estimate_text_tokens(
     text: str,
     *,
@@ -48,10 +61,7 @@ def estimate_text_tokens(
     """Estimate the token count of a plain string (for tool-output truncation)."""
     enc_name = encoding or DEFAULT_ENCODING
     try:
-        import tiktoken
-
-        enc = tiktoken.get_encoding(enc_name)
-        return len(enc.encode(text, disallowed_special=()))
+        return len(_encode(text, enc_name))
     except (ImportError, ValueError):
         return max(1, len(text) // char_per_token)
 
@@ -68,24 +78,44 @@ def truncate_text_to_tokens(
     Token-precise when tiktoken is available; falls back to a character budget
     (``max_tokens * char_per_token``) otherwise. Used as the last-resort truncation
     for tool outputs and for capping summary length.
+
+    The output is verified to fit the budget: the truncation marker itself costs
+    tokens, so the head/tail halves shrink until the whole result fits. When the
+    budget is smaller than the marker (a few tokens), the smallest representable
+    form (1 head + marker + 1 tail token) is returned as a best effort.
     """
     enc_name = encoding or DEFAULT_ENCODING
     try:
-        import tiktoken
-
-        enc = tiktoken.get_encoding(enc_name)
-        tokens = enc.encode(text, disallowed_special=())
-        if len(tokens) <= max_tokens:
-            return text
-        half = max(max_tokens // 2, 1)
-        head, tail = enc.decode(tokens[:half]), enc.decode(tokens[len(tokens) - half :])
-        return f"{head}\n...[truncated ~{len(tokens) - 2 * half} tokens]...\n{tail}"
+        tokens = _encode(text, enc_name)
     except (ImportError, ValueError):
         budget = max_tokens * char_per_token
         if len(text) <= budget:
             return text
-        half = max(budget // 2, 1)
-        return f"{text[:half]}\n...[truncated {len(text) - 2 * half} chars]...\n{text[len(text) - half :]}"
+        half = budget // 2
+        while half >= 1:
+            out = _join_cut(text[:half], len(text) - 2 * half, "chars", text[len(text) - half :])
+            if len(out) <= budget:
+                return out
+            half //= 2
+        return _join_cut(text[:1], len(text) - 2, "chars", text[-1:])
+
+    if len(tokens) <= max_tokens:
+        return text
+    enc = _get_encoder(enc_name)
+    half = max_tokens // 2
+    while half >= 1:
+        out = _join_cut(
+            enc.decode(tokens[:half]), len(tokens) - 2 * half, "tokens", enc.decode(tokens[len(tokens) - half :])
+        )
+        if len(_encode(out, enc_name)) <= max_tokens:
+            return out
+        half //= 2
+    # Budget is smaller than the marker itself: best-effort minimal cut.
+    return _join_cut(enc.decode(tokens[:1]), len(tokens) - 2, "tokens", enc.decode(tokens[len(tokens) - 1 :]))
+
+
+def _join_cut(head: str, dropped: int, unit: str, tail: str) -> str:
+    return f"{head}\n...[truncated ~{dropped} {unit}]...\n{tail}"
 
 
 def estimate_tokens(
@@ -99,15 +129,13 @@ def estimate_tokens(
 
     Uses tiktoken with the given encoding (default ``o200k_base``); falls back to
     ``len(text) // char_per_token`` if tiktoken is unavailable or the encoding is
-    unknown. Includes `ModelRequest.instructions`.
+    unknown. The agent system prompt (`ModelRequest.instructions`) is counted once
+    (see `render_message_texts`).
     """
     text = render_messages_to_text(messages, include_thinking=include_thinking)
     enc_name = encoding or DEFAULT_ENCODING
     try:
-        import tiktoken
-
-        enc = tiktoken.get_encoding(enc_name)
-        return len(enc.encode(text, disallowed_special=()))
+        return len(_encode(text, enc_name))
     except (ImportError, ValueError):
         return max(1, len(text) // char_per_token)
 

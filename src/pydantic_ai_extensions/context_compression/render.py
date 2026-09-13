@@ -2,7 +2,9 @@
 
 Two independent renderers:
 - `render_messages_to_text`: flat prose rendering, used only for token estimation
-  (§5.4). Includes `ModelRequest.instructions`.
+  (§5.4). Includes the agent system prompt (`ModelRequest.instructions`) *once* --
+  the framework stamps instructions onto every request, but the wire format sends
+  them as a single system prompt per API call.
 - `render_structured`: XML-ish structured rendering, used as the summarizer input
   (§5.8, the only input mode).
 """
@@ -31,26 +33,46 @@ from pydantic_ai.messages import (
     UserPromptPart,
 )
 
-__all__ = ["render_messages_to_text", "render_structured", "stringify"]
+__all__ = ["render_message_texts", "render_messages_to_text", "render_structured", "stringify"]
+
+
+def _is_media_like(x: Any) -> bool:
+    """Duck-type BinaryContent (any object with `data` + `media_type`)."""
+    return hasattr(x, "data") and hasattr(x, "media_type")
+
+
+def _json_default(o: Any) -> str:
+    if _is_media_like(o) or isinstance(o, (bytes, bytearray, memoryview)):
+        return "<binary>"
+    return str(o)
 
 
 def stringify(x: Any) -> str:
-    """Best-effort text rendering of a part payload (args/content)."""
+    """Best-effort text rendering of a part payload (args/content).
+
+    Binary media (`BinaryContent` or anything duck-typed by `data`+`media_type`) --
+    including media nested inside dicts/lists/pydantic models -- renders as
+    ``<binary>`` so raw bytes never inflate the text (which would skew token
+    estimates and leak into truncation output / the summarizer prompt).
+    """
     if x is None:
         return ""
     if isinstance(x, str):
         return x
-    if hasattr(x, "data") and hasattr(x, "media_type"):
-        return "<binary>"  # BinaryContent (duck-typed)
-    if isinstance(x, (dict, list)):
+    if isinstance(x, (bytes, bytearray, memoryview)) or _is_media_like(x):
+        return "<binary>"
+    if isinstance(x, (dict, list, tuple)):
         y = cast(Any, x)
         try:
-            return json.dumps(y, ensure_ascii=False, default=str)
+            return json.dumps(y, ensure_ascii=False, default=_json_default)
         except (TypeError, ValueError):
             return str(y)
     # pydantic models / dataclasses / other objects
     if hasattr(x, "model_dump_json"):
-        return x.model_dump_json()
+        try:
+            return json.dumps(x.model_dump(), ensure_ascii=False, default=_json_default)
+        except Exception:
+            return x.model_dump_json()  # type: ignore[no-any-return]
     return str(x)
 
 
@@ -58,7 +80,7 @@ def _user_prompt_text(content: str | Sequence[Any]) -> str:
     """Extract text from `UserPromptPart.content` (str or sequence of UserContent)."""
     if isinstance(content, str):
         return content
-    if hasattr(content, "data") and hasattr(content, "media_type"):
+    if _is_media_like(content):
         return "<media>"  # BinaryContent (duck-typed)
     # Sequence of UserContent items (str, TextContent, ImageUrl, BinaryContent, ...)
     if isinstance(content, (list, tuple)):
@@ -66,8 +88,7 @@ def _user_prompt_text(content: str | Sequence[Any]) -> str:
         for item in content:
             if isinstance(item, str):
                 chunks.append(item)
-            elif hasattr(item, "data") and hasattr(item, "media_type"):
-                # BinaryContent (duck-typed to avoid isinstance-on-Protocol issues in some IDEs)
+            elif _is_media_like(item):
                 chunks.append("<media>")
             elif hasattr(item, "content") and isinstance(item.content, str):
                 # TextContent (duck-typed)
@@ -78,22 +99,43 @@ def _user_prompt_text(content: str | Sequence[Any]) -> str:
     return stringify(content)
 
 
-def render_messages_to_text(messages: Sequence[ModelMessage], *, include_thinking: bool = True) -> str:
-    """Flat prose rendering of messages, for token estimation only.
+def render_message_texts(messages: Sequence[ModelMessage], *, include_thinking: bool = True) -> list[str]:
+    """Render each message to a flat prose string (one entry per message).
 
-    Includes each `ModelRequest.instructions` (the agent system prompt field) before
-    its parts. Tool calls/returns are rendered as readable prose. Multi-modal items
-    become `<media>` (lossy).
+    The agent system prompt (`ModelRequest.instructions`) is included exactly once --
+    attached to the *last* request that carries it. pydantic-ai stamps instructions
+    onto every request it appends to the history, but providers receive them as a
+    single system prompt per API call, so counting each stamped copy would inflate
+    the estimate in proportion to the number of turns. Attributing the prompt to the
+    last carrier keeps every suffix estimate (``messages[k:]``) correct too: a suffix
+    contains a carrier iff it contains the global last carrier.
     """
-    lines: list[str] = []
-    for msg in messages:
+    last_instructions_idx = -1
+    for i, msg in enumerate(messages):
         if isinstance(msg, ModelRequest) and msg.instructions:
+            last_instructions_idx = i
+
+    texts: list[str] = []
+    for i, msg in enumerate(messages):
+        lines: list[str] = []
+        if i == last_instructions_idx and isinstance(msg, ModelRequest) and msg.instructions:
             lines.append(msg.instructions)
         for part in msg.parts:
             text = _render_part_flat(part, include_thinking=include_thinking)
             if text is not None:
                 lines.append(text)
-    return "\n".join(lines)
+        texts.append("\n".join(lines))
+    return texts
+
+
+def render_messages_to_text(messages: Sequence[ModelMessage], *, include_thinking: bool = True) -> str:
+    """Flat prose rendering of messages, for token estimation only.
+
+    Includes the agent system prompt (`ModelRequest.instructions`) once (see
+    `render_message_texts`). Tool calls/returns are rendered as readable prose.
+    Multi-modal items become `<media>` (lossy).
+    """
+    return "\n".join(render_message_texts(messages, include_thinking=include_thinking))
 
 
 def _render_part_flat(part: Any, *, include_thinking: bool) -> str | None:
@@ -126,11 +168,17 @@ def render_structured(messages: Sequence[ModelMessage]) -> str:
 
     Each part becomes a `<message>` tagged with its role; tool calls/returns carry
     structured attributes (`tool_call`, `tool_name`, `tool_call_id`, `arguments`).
-    Wrapped in `<conversation-history>`. Multi-modal items become `<media>`.
+    Wrapped in `<conversation-history>`. Multi-modal items become `<media>`. The
+    agent system prompt (`ModelRequest.instructions`) is included once (last carrier),
+    mirroring `render_messages_to_text` -- the framework stamps it onto every request.
     """
     inner: list[str] = ["<conversation-history>"]
-    for msg in messages:
+    last_instructions_idx = -1
+    for i, msg in enumerate(messages):
         if isinstance(msg, ModelRequest) and msg.instructions:
+            last_instructions_idx = i
+    for i, msg in enumerate(messages):
+        if i == last_instructions_idx and isinstance(msg, ModelRequest) and msg.instructions:
             inner.append(f'  <message role="system">{escape(msg.instructions)}</message>')
         for part in msg.parts:
             inner.append(f"  {_render_part_structured(part)}")

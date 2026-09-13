@@ -4,7 +4,7 @@ See `docs/context-compression.md` for the full design.
 """
 
 from .capability import ContextCompression
-from .render import render_messages_to_text, render_structured
+from .render import render_message_texts, render_messages_to_text, render_structured
 from .slicing import find_safe_split, is_safe_cutoff_point, partition_head
 from .store import SummaryRecord, SummaryStore
 from .summarizer import (
@@ -12,10 +12,12 @@ from .summarizer import (
     find_summary,
     merge_usage,
     parse_summary_sentinel,
+    prefix_body_after,
     summarize_full,
     summarize_incremental,
 )
 from .tokenizer import (
+    DEFAULT_ENCODING,
     DEFAULT_MAX_TOKENS,
     ContextSize,
     estimate_text_tokens,
@@ -25,6 +27,7 @@ from .tokenizer import (
 )
 
 __all__ = [
+    "DEFAULT_ENCODING",
     "DEFAULT_MAX_TOKENS",
     "ContextCompression",
     "ContextSize",
@@ -39,6 +42,8 @@ __all__ = [
     "merge_usage",
     "parse_summary_sentinel",
     "partition_head",
+    "prefix_body_after",
+    "render_message_texts",
     "render_messages_to_text",
     "render_structured",
     "should_trigger",

@@ -46,6 +46,12 @@ class SummaryStore(Protocol):
 
     Implementations key by `ctx.conversation_id` and must be concurrency-safe. Only
     `conversation_id` is used (not deps), so the protocol is non-generic.
+
+    Note: `conversation_id` is resolved per run from the explicit `conversation_id`
+    argument, the most recent id on `message_history`, or a *fresh UUID7*. A store
+    only hits across runs if the caller passes the same id on every `agent.run` --
+    otherwise every run gets a new id, `get` always misses, and compaction silently
+    degrades to a full re-summarize each time.
     """
 
     async def get(self, ctx: RunContext[Any]) -> SummaryRecord | None: ...

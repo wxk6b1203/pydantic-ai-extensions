@@ -43,7 +43,7 @@ agent = Agent(
 result = agent.run_sync('...', message_history=history)
 ```
 
-压缩发生时，较旧的历史被替换为一条带 `<conversation-summary ...>` 标记的摘要消息（sentinel），工具调用/返回按 `tool_call_id` 精确配对、绝不拆散。
+压缩发生时，较旧的历史被替换为一条带 `<conversation-summary ...>` 标记的摘要消息（sentinel，正文带 crc32 校验和，模型回显的同格式文本不会被误认为真摘要），工具调用/返回按 `tool_call_id` 精确配对、绝不拆散。
 
 ## 特性
 
@@ -52,7 +52,7 @@ result = agent.run_sync('...', message_history=history)
 - **冷却机制**：压缩后历史仍高于阈值时，仅在历史较上次基线再增长 `min_recompact_growth_tokens`（默认 2048）后才重新压缩——避免工具循环内每一步都调摘要器
 - **两种持久化模式**：`persist=True`（压缩结果写回历史，默认）/ `persist=False`（仅模型看到压缩视图，原始历史不动，配 `SummaryStore` 跨 run 增量）
 - **Provider 守卫**：自动识别并拒绝具备原生 compaction 的模型（解包 `WrapperModel` 后判定），fail-fast
-- **工具输出截断**（可选）：`max_tool_output_tokens` 从源头限长大工具返回，行级头/尾截断 + token 精确中段截断兜底；`BinaryContent` 不受影响
+- **工具输出截断**（可选）：`max_tool_output_tokens` 从源头限长大工具返回，行级头/尾截断 + token 精确中段截断兜底，截断结果严格不超过预算；`BinaryContent`（含嵌套在结构内的媒体）不受影响。注意：超限的**非字符串**结果（dict/list/pydantic 模型）会被替换为其截断后的字符串渲染——对模型无损，但依赖原始 Python 类型的下游（持久化 schema、审计回放）需知悉
 - **摘要长度上限**（可选）：`max_summary_tokens` 防止啰嗦的摘要器让压缩后反而膨胀
 - **失败降级**：摘要器 API/网络故障时自动降级为不压缩（记 warning 日志），不阻断父 run；编程错误则故意上抛
 - **可组合**：声明 `wrapped_by=[ReinjectSystemPrompt]` 的标准 capability 排序，与 `ProcessHistory` 等能力共存
@@ -82,10 +82,10 @@ result = agent.run_sync('...', message_history=history)
 ## 持久化与 `new_messages()` 的重要注意事项
 
 - **`persist=True` 必须用 `result.all_messages()` 做快照式持久化**。压缩插入的摘要消息不带 `run_id`，**不会**出现在 `result.new_messages()` 中——依赖 `new_messages()` 增量追加持久化的服务会丢失压缩结果，应改用 `persist=False` + `SummaryStore`。
-- **`persist=False` 要求每轮加载完整连续历史**（`covered_count` 是历史索引）；`SummaryStore` 按 `ctx.conversation_id` 索引，实现方需保证并发安全。
+- **`persist=False` 要求每轮加载完整连续历史**（`covered_count` 是历史索引）；`SummaryStore` 按 `ctx.conversation_id` 索引，实现方需保证并发安全。**必须给每次 `agent.run` 传稳定的 `conversation_id`**——否则每 run 生成新的 UUID7，store 永远 miss，静默退化为每次全量重摘要。
 - **压缩阈值是触发线，不是上限**：压缩后 `summary + keep` 不保证 ≤ 阈值，更不保证 ≤ 模型窗口。`keep` 相对阈值/窗口设过大会使压缩失效，请按模型窗口留足余量。
-- token 估算不含随请求发送的 **tool definitions**，工具多的 agent 会系统性低估，fraction 阈值请留余量。
-- 摘要 sentinel 以纯文本 `TextPart` 存在于历史中（可读、可持久化、可跨 provider round-trip）；终端 UI 若直接渲染 `all_messages()` 会看到 `<conversation-summary ...>` 标记文本。
+- token 估算不含随请求发送的 **tool definitions** 与输出 schema，工具多的 agent 会系统性低估，fraction 阈值请留余量。系统提示（agent `instructions`）**只计一次**（框架会把 instructions 盖章到每条历史请求上，但线上协议每次调用只发一份；估算按最后一条载体计，避免随对话轮数线性膨胀）。嵌套在结构内的二进制媒体按 `<binary>` 计，不泄漏原始字节。
+- 摘要 sentinel 以纯文本 `TextPart` 存在于历史中（可读、可持久化、可跨 provider round-trip）；终端 UI 若直接渲染 `all_messages()` 会看到 `<conversation-summary ...>` 标记文本。标记带正文校验和，旧版无校验和的 sentinel 仍可解析。
 
 ## Provider 兼容性
 
@@ -108,7 +108,9 @@ make typecheck  # pyright (strict)
 make version    # 从当前 git 状态重新生成 _version.py（构建时也会自动生成）
 make build      # 打 wheel + sdist 到 dist/（构建时自动烘焙 git 版本）
 
-uv run pytest --live -m live   # 真实 API 测试（需 DEEPSEEK_API_KEY / DEEPSEEK_BASE_URL / DEEPSEEK_MODEL 环境变量，默认跳过）
+uv run pytest --live -m live   # 真实 API 测试（默认跳过）。凭据从环境变量或仓库根目录 `.env`（gitignored）读取：
+                              # DEEPSEEK_API_KEY / TP_COPILOT_API_KEY（key，必填）、DEEPSEEK_BASE_URL（缺省用 DeepSeek 官方端点）、
+                              # DEEPSEEK_MODEL / TP_COPILOT_MODEL（模型名）
 ```
 
 ## 版本信息（git 烘焙，零第三方依赖）

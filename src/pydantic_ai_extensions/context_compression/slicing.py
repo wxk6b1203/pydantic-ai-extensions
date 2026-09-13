@@ -20,7 +20,8 @@ from pydantic_ai.messages import (
     ToolReturnPart,
 )
 
-from .tokenizer import DEFAULT_MAX_TOKENS, ContextSize, estimate_tokens
+from .render import render_message_texts
+from .tokenizer import DEFAULT_MAX_TOKENS, ContextSize, estimate_text_tokens
 
 __all__ = ["find_safe_split", "is_safe_cutoff_point", "partition_head"]
 
@@ -58,6 +59,48 @@ def is_safe_cutoff_point(messages: Sequence[ModelMessage], k: int) -> bool:
     request is always retained.
     """
     return not (_call_ids_in_prefix(messages, k) & _return_ids_in_recent(messages, k))
+
+
+def _per_message_token_counts(
+    messages: Sequence[ModelMessage],
+    *,
+    encoding: str | None,
+    char_per_token: int,
+    include_thinking: bool,
+) -> list[int]:
+    """Token count of each message, rendered individually.
+
+    Approximation note: the joined-history render counts ~1 separator token per
+    message boundary that this per-message sum omits -- negligible for a cutoff
+    heuristic, and it buys a single encoding pass instead of O(log n) full passes.
+    """
+    texts = render_message_texts(messages, include_thinking=include_thinking)
+    return [estimate_text_tokens(t, encoding=encoding, char_per_token=char_per_token) for t in texts]
+
+
+def _token_cutoff_from_counts(counts: Sequence[int], budget: int) -> int:
+    """Largest cutoff where the recent-window token sum ``>= budget`` (0 if total < budget).
+
+    ``keep`` is a *lower bound*: keep a recent window of *at least* ``budget`` tokens,
+    as small as possible. ``counts[i]`` is the token count of ``messages[i]``; suffix
+    sums let the binary search run on precomputed integers instead of re-encoding the
+    suffix on every probe.
+    """
+    n = len(counts)
+    if n == 0 or sum(counts) < budget:
+        return 0
+    suffix = [0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        suffix[i] = suffix[i + 1] + counts[i]
+    lo, hi, ans = 0, n - 1, 0
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if suffix[mid] >= budget:
+            ans = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return ans
 
 
 def _token_cutoff(
@@ -111,6 +154,10 @@ def find_safe_split(
     max_tokens: int | None = None,
     keep_first_user_message: bool = True,
     count_tokens: Callable[[Sequence[ModelMessage]], int] | None = None,
+    *,
+    encoding: str | None = None,
+    char_per_token: int = 4,
+    include_thinking: bool = True,
 ) -> int:
     """Find the largest safe cutoff ``k`` (prefix=``messages[:k]``, recent=``messages[k:]``)
     that respects the ``keep`` spec and never orphans a tool-call/return pair.
@@ -118,12 +165,39 @@ def find_safe_split(
     Walks ``k`` backward from the ideal target until :func:`is_safe_cutoff_point` holds.
     Returns 0 if ``keep_first_user_message`` and the safe prefix would be <= 1 message
     (nothing meaningful to summarize).
+
+    Token-based ``keep`` specs are resolved from per-message suffix sums (one encoding
+    pass) unless a custom ``count_tokens`` is injected, in which case the counter is
+    re-run per binary-search probe (exact but O(log n) full passes).
     """
     n = len(messages)
     if n == 0:
         return 0
-    counter: Callable[[Sequence[ModelMessage]], int] = count_tokens or (lambda msgs: estimate_tokens(msgs))
-    k = _keep_target(messages, keep, max_tokens, counter)
+    if count_tokens is None:
+        counts = _per_message_token_counts(
+            messages,
+            encoding=encoding,
+            char_per_token=char_per_token,
+            include_thinking=include_thinking,
+        )
+
+        def target() -> int:
+            match keep:
+                case ("messages", count):
+                    return max(n - max(count, 1), 0)
+                case ("tokens", budget):
+                    return _token_cutoff_from_counts(counts, budget)
+                case ("fraction", frac):
+                    return _token_cutoff_from_counts(counts, int((max_tokens or DEFAULT_MAX_TOKENS) * frac))
+                case _:
+                    raise ValueError(f"Invalid keep: {keep!r}")
+
+    else:
+
+        def target() -> int:
+            return _keep_target(messages, keep, max_tokens, count_tokens)
+
+    k = target()
     while k > 0 and not is_safe_cutoff_point(messages, k):
         k -= 1
     if keep_first_user_message and k <= 1:
