@@ -164,9 +164,11 @@ class CustomBuildHook(BuildHookInterface):  # type: ignore[misc]
 
     def initialize(self, version: str, build_data: dict[str, Any]) -> None:
         write_version_file(Path(self.root))
-        # The generated file is gitignored, so the sdist (VCS-filtered) would drop it.
-        # Force it in so a wheel built *from* that sdist still carries provenance -- the
-        # hook then preserves it (see ``write_version_file``) instead of rewriting unknown.
-        if self.target_name == "sdist":
+        # The generated file is gitignored, so VCS-filtered file selection would drop it
+        # from both artifacts. Force it in: the sdist needs it so a wheel built *from*
+        # that sdist still carries provenance (the hook then preserves it, see
+        # ``write_version_file``), and the wheel needs it because build-time generated
+        # files must not depend on whether the toolchain happens to apply ignore rules.
+        if self.target_name in ("sdist", "wheel"):
             build_data.setdefault("force_include", {})[str(Path(self.root) / _VERSION_FILE)] = str(_VERSION_FILE)
         self.app.display_debug(f"pydantic-ai-extensions: baked for {self.target_name}")
